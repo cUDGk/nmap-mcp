@@ -2,6 +2,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import { z } from "zod";
 import { XMLParser } from "fast-xml-parser";
 
@@ -130,6 +132,7 @@ function buildArgs(base: string[], opts: {
   reason?: boolean;
   open_only?: boolean;
   resolve_dns?: boolean;
+  traceroute?: boolean;
   extra_args?: string[];
 }): string[] {
   const args: string[] = [...base];
@@ -150,6 +153,7 @@ function buildArgs(base: string[], opts: {
   if (opts.min_rate !== undefined) args.push("--min-rate", String(opts.min_rate));
   if (opts.reason) args.push("--reason");
   if (opts.open_only) args.push("--open");
+  if (opts.traceroute) args.push("--traceroute");
   if (opts.resolve_dns === false) args.push("-n");
   if (opts.resolve_dns === true) args.push("-R");
   if (opts.extra_args) args.push(...opts.extra_args);
@@ -205,7 +209,7 @@ Output: { stats, hosts[] }. hosts[] includes addresses, hostnames, ports[] with 
 
 Security note: only scan networks you are authorized to. OS detection (-O) and SYN scan (-sS) need admin/root on most systems.`,
   {
-    action: z.enum(["discover", "scan", "services", "os_detect", "run", "version"]).describe("Action"),
+    action: z.enum(["discover", "scan", "services", "os_detect", "arp", "vuln", "run", "from_xml", "version"]).describe("Action"),
     target: z.string().optional().describe("Target: host / CIDR / range / hostname"),
     ports: z.string().optional().describe("Ports (e.g. '22,80,443' or '1-1024')"),
     top_ports: z.number().int().positive().optional().describe("Scan top N ports"),
@@ -224,9 +228,12 @@ Security note: only scan networks you are authorized to. OS detection (-O) and S
     reason: z.boolean().optional().describe("--reason"),
     open_only: z.boolean().optional().describe("--open"),
     resolve_dns: z.boolean().optional().describe("DNS resolution (false → -n, true → -R)"),
+    traceroute: z.boolean().optional().describe("--traceroute"),
     extra_args: z.array(z.string()).optional().describe("Extra nmap args"),
     args: z.array(z.string()).optional().describe("run: raw args (still add -oX -)"),
     timeout: z.number().optional().describe("Per-call timeout ms (default NMAP_TIMEOUT=600000)"),
+    save_xml: z.string().optional().describe("If set, write raw nmap XML to this path"),
+    xml_path: z.string().optional().describe("from_xml: path to existing nmap XML file"),
   },
   async (p) => {
     try {
@@ -238,6 +245,13 @@ Security note: only scan networks you are authorized to. OS detection (-O) and S
           exit_code: r.exit_code,
         });
       }
+      if (p.action === "from_xml") {
+        if (!p.xml_path) return errContent("from_xml requires 'xml_path'");
+        const abs = resolvePath(p.xml_path);
+        const xml = readFileSync(abs, "utf8");
+        const parsed = parseNmapXml(xml);
+        return textContent({ source_path: abs, ...parsed });
+      }
       if (p.action === "run") {
         if (!p.args) return errContent("run requires 'args'");
         const args = [...p.args];
@@ -245,6 +259,7 @@ Security note: only scan networks you are authorized to. OS detection (-O) and S
         const r = await runNmap(args, { timeout: p.timeout });
         let parsed: any;
         try { parsed = parseNmapXml(r.stdout); } catch { parsed = undefined; }
+        if (p.save_xml && r.stdout) writeFileSync(resolvePath(p.save_xml), r.stdout, "utf8");
         return buildResponse(r, parsed);
       }
       if (!p.target) return errContent(`${p.action} requires 'target'`);
@@ -254,6 +269,10 @@ Security note: only scan networks you are authorized to. OS detection (-O) and S
       if (p.action === "discover") {
         base = [];
         opts.host_discovery = "ping_only";
+      } else if (p.action === "arp") {
+        base = [];
+        opts.host_discovery = "ping_only";
+        opts.extra_args = [...(opts.extra_args ?? []), "-PR"];
       } else if (p.action === "services") {
         base = [];
         opts.service_detect = true;
@@ -262,11 +281,18 @@ Security note: only scan networks you are authorized to. OS detection (-O) and S
         base = [];
         opts.os_detect = true;
         opts.service_detect = true;
+      } else if (p.action === "vuln") {
+        base = [];
+        opts.service_detect = true;
+        opts.script = opts.script ? `${opts.script},vuln` : "vuln";
       } else {
         base = [];
       }
       const args = buildArgs(base, opts);
       const r = await runNmap(args, { timeout: p.timeout });
+      if (p.save_xml && r.stdout) {
+        try { writeFileSync(resolvePath(p.save_xml), r.stdout, "utf8"); } catch {}
+      }
       if (r.exit_code !== 0 && !r.stdout.trim()) {
         return buildResponse(r);
       }
