@@ -13,6 +13,25 @@ const NMAP = process.env.NMAP_PATH ?? (process.platform === "win32"
 const DEFAULT_TIMEOUT = parseInt(process.env.NMAP_TIMEOUT ?? "600000", 10);
 const MAX_STDERR = 16384;
 
+/**
+ * Some MCP clients (notably Claude Code LLM tool-use path) marshal object /
+ * array arguments to JSON strings before they reach the server, even when the
+ * tool schema declares them as arrays. This helper accepts either the original
+ * value or a JSON-encoded string that parses back to an object / array.
+ */
+function coerceObject<T>(val: unknown): T | undefined {
+  if (val === undefined || val === null) return undefined;
+  if (typeof val === "string") {
+    try {
+      const parsed = JSON.parse(val);
+      if (parsed !== null && typeof parsed === "object") return parsed as T;
+    } catch {}
+    return undefined;
+  }
+  if (typeof val === "object") return val as T;
+  return undefined;
+}
+
 function killProc(proc: ChildProcess): void {
   if (!proc.pid) return;
   if (process.platform === "win32") {
@@ -229,8 +248,8 @@ Security note: only scan networks you are authorized to. OS detection (-O) and S
     open_only: z.boolean().optional().describe("--open"),
     resolve_dns: z.boolean().optional().describe("DNS resolution (false → -n, true → -R)"),
     traceroute: z.boolean().optional().describe("--traceroute"),
-    extra_args: z.array(z.string()).optional().describe("Extra nmap args"),
-    args: z.array(z.string()).optional().describe("run: raw args (still add -oX -)"),
+    extra_args: z.union([z.array(z.string()), z.string()]).optional().describe("Extra nmap args"),
+    args: z.union([z.array(z.string()), z.string()]).optional().describe("run: raw args (still add -oX -)"),
     timeout: z.number().optional().describe("Per-call timeout ms (default NMAP_TIMEOUT=600000)"),
     save_xml: z.string().optional().describe("If set, write raw nmap XML to this path"),
     xml_path: z.string().optional().describe("from_xml: path to existing nmap XML file"),
@@ -253,8 +272,9 @@ Security note: only scan networks you are authorized to. OS detection (-O) and S
         return textContent({ source_path: abs, ...parsed });
       }
       if (p.action === "run") {
-        if (!p.args) return errContent("run requires 'args'");
-        const args = [...p.args];
+        const rawArgs = coerceObject<string[]>(p.args);
+        if (!rawArgs || !Array.isArray(rawArgs)) return errContent("run requires 'args' (string[])");
+        const args = [...rawArgs];
         if (!args.includes("-oX")) args.push("-oX", "-");
         const r = await runNmap(args, { timeout: p.timeout });
         let parsed: any;
